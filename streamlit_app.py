@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import networkx as nx
 import folium
+from folium.plugins import MarkerCluster
 from streamlit_folium import folium_static
 from geopy.distance import geodesic
 from sklearn.neighbors import BallTree
@@ -21,29 +22,32 @@ def cargar_datos(ruta):
     return df.reset_index(drop=True)
 
 # Función para calcular distancias entre viviendas con vecinos más cercanos
+@st.cache_data
 def calcular_distancias_viviendas(df, k_vecinos=25):
-    coords = np.radians(df[['LATITUD', 'LONGITUD']].values)
-    # Crea un BallTree con métrica haversine
+    coords = np.radians(df[['LATITUD', 'LONGITUD']].to_numpy())
     tree = BallTree(coords, metric='haversine')
-    # Numero de vecinos a consultar
-    k = k_vecinos + 1
-    # Encuentra los k vecinos más cercanos y sus distancias
+    k = min(k_vecinos + 1, len(coords))
     distancias, indices = tree.query(coords, k=k)
+
     dist_km = distancias[:, 1:] * 6371
     indices_k = indices[:, 1:]
 
-    data = []
-    # Para cada punto, guartda los pares de distancia
-    for i, (vecinos, dists) in enumerate(zip(indices_k, dist_km)):
-        for j, dist in zip(vecinos, dists):
-            id1 = df.iloc[i]['PK_REGISTRO']
-            id2 = df.iloc[j]['PK_REGISTRO']
-            data.append((id1, id2, round(dist, 3)))
+    idx_origen = np.repeat(np.arange(len(df)), indices_k.shape[1])
+    idx_destino = indices_k.reshape(-1)
+    dist_flat = dist_km.reshape(-1)
 
-    # Se crea el DataFrame con las distancias
-    df_distancias = pd.DataFrame(data, columns=['PK_1', 'PK_2', 'DISTANCIA_KM'])
-    df_distancias['ID'] = df_distancias.apply(lambda x: tuple(sorted([x['PK_1'], x['PK_2']])), axis=1)
-    df_distancias = df_distancias.drop_duplicates('ID').drop(columns='ID').reset_index(drop=True)
+    pk = df['PK_REGISTRO'].to_numpy()
+    pk1 = pk[idx_origen]
+    pk2 = pk[idx_destino]
+    pk_min = np.minimum(pk1, pk2)
+    pk_max = np.maximum(pk1, pk2)
+
+    df_distancias = pd.DataFrame({
+        'PK_1': pk_min,
+        'PK_2': pk_max,
+        'DISTANCIA_KM': np.round(dist_flat, 3)
+    })
+    df_distancias = df_distancias.drop_duplicates(['PK_1', 'PK_2']).reset_index(drop=True)
 
     return df_distancias
 
@@ -59,6 +63,7 @@ def conectar_nodos(n1, n2, df, grafo):
         grafo.add_edge(n1, n2, weight=round(distancia_km, 3))
 
 # Función para construir el grafo a partir de los dataframes
+@st.cache_resource
 def construir_grafo(df_anemia, df_distancia):
     G = nx.Graph()
     colores = []
@@ -94,15 +99,13 @@ def construir_grafo(df_anemia, df_distancia):
     return G, colores
 
 # Función que genera el mapa inicial
-def generar_mapa(G, colores, df):
-    # Se inicializa el mapa
+@st.cache_resource
+def generar_mapa(_G, colores, df):
     mapa = folium.Map(location=[-6.5, -76.5], zoom_start=8)
+    marker_cluster = MarkerCluster().add_to(mapa)
 
-    # Se recorre el grafo para mostrar los nodos en el mapa
-    for n, d in G.nodes(data=True):
-        
+    for n, d in _G.nodes(data=True):
         if n < len(df):
-            # Se usará el marcador de círculo para representar los nodos
             folium.CircleMarker(
                 location=(d['pos_lat'], d['pos_lon']),
                 radius=4,
@@ -111,9 +114,8 @@ def generar_mapa(G, colores, df):
                 fill_color=colores[n],
                 fill_opacity=0.9,
                 tooltip=f"Paciente Nº {n}<br>Edad: {df.iloc[n]['EDAD_REGISTRO']}<br>Severidad: {df.iloc[n]['GRADO_SEVERIDAD']}<br>Hospital: {df.iloc[n]['NOMBRE_ESTABLECIMIENTO']}"
-            ).add_to(mapa)
+            ).add_to(marker_cluster)
         else:
-            # Para los hospitales, se usa un marcador normal
             folium.Marker(
                 location=(d['pos_lat'], d['pos_lon']),
                 icon=folium.Icon(color='blue', icon='plus-sign'),
@@ -158,8 +160,7 @@ def generar_mapa_ruta(G, colores, nodos_ruta, df):
     return mapa
 
 def agregar_hospitales_al_grafo(G, colores, df_anemia, df_hospitales, k_vecinos=15):
-    offset = len(G.nodes)  # índice donde empezarán los hospitales
-    
+    offset = len(G.nodes)
     coords_anemia = np.radians(df_anemia[['LATITUD', 'LONGITUD']].values)
     tree = BallTree(coords_anemia, metric='haversine')
     
@@ -170,13 +171,19 @@ def agregar_hospitales_al_grafo(G, colores, df_anemia, df_hospitales, k_vecinos=
         G.add_node(idx, pos_lat=lat, pos_lon=lon, cod=nombre)
         colores.append('blue')
 
-        # Se conecta a k vecinos más cercanos
         coord_hosp = np.radians([[lat, lon]])
-        distancias, indices = tree.query(coord_hosp, k=k_vecinos)
+        distancias, indices = tree.query(coord_hosp, k=min(k_vecinos, len(coords_anemia)))
 
         for dist, index in zip(distancias[0], indices[0]):
             distancia_km = dist * 6371
             G.add_edge(idx, index, weight=round(distancia_km, 3))
+
+@st.cache_resource
+def construir_grafo_completo(df_anemia, df_hospitales, k_vecinos_viviendas=25, k_vecinos_hospitales=15):
+    df_distancias = calcular_distancias_viviendas(df_anemia, k_vecinos=k_vecinos_viviendas)
+    G, colores = construir_grafo(df_anemia, df_distancias)
+    agregar_hospitales_al_grafo(G, colores, df_anemia, df_hospitales, k_vecinos=k_vecinos_hospitales)
+    return G, colores
 
 
 # Página de Streamlit
@@ -193,18 +200,15 @@ df_hospitales = pd.DataFrame({
 # Inicialización de variables
 ruta = "ANEMIA_DA.csv"
 Data_Anemia = cargar_datos(ruta)
-df_distancias = calcular_distancias_viviendas(Data_Anemia)
-G,color = construir_grafo(Data_Anemia,df_distancias)
-agregar_hospitales_al_grafo(G, color, Data_Anemia, df_hospitales)
+G, color = construir_grafo_completo(Data_Anemia, df_hospitales)
 mapa = generar_mapa(G, color, Data_Anemia)
 
 # Interfaz de usuario
 st.title("Anemia en el departamento de San Martín")
 
-st.subheader("""Integrantes del equipo: 
-            \n  - Gianmarco Fabian Jiménez Guerra - U202123843""")
+st.subheader("""Gianmarco Fabian Jiménez Guerra""")
 
-st.subheader("📍 Mapa de conexiones geográficas de pacientes")
+st.subheader("Mapa de conexiones geográficas de pacientes")
 folium_static(mapa)
 
 # Selección de opciones de algoritmos
